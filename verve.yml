@@ -20,7 +20,7 @@ services:
       - .env
     environment:
       - HOST=0.0.0.0
-      - NODE_ENV=production
+      - NODE_ENV=development
       # - MONGO_URI=mongodb://mongodb:27017/LibreChat
       - MONGO_URL=mongodb+srv://verve_db_user:zxWWxmaweopGVtvg@cluster0.yhz8ht5.mongodb.net/LibreChat?retryWrites=true
       - MEILI_HOST=http://meilisearch:7700
