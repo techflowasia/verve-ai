@@ -4,8 +4,8 @@ services:
     #   context: .
     #   dockerfile: Dockerfile.multi
     #   target: api-build
-    image: ghcr.io/danny-avila/librechat-dev-api:latest
-    # image: ghcr.io/prawee/librechat-dev-api:latest 
+    # image: ghcr.io/danny-avila/librechat-dev-api:latest
+    image: ghcr.io/prawee/librechat-dev-api-x64:latest 
     # image: ghcr.io/techflowasia/librechat-dev-api:latest
     container_name: verve-api
     ports:
