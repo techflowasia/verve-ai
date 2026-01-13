@@ -38,14 +38,13 @@ const {
   grantPermission,
 } = require('~/server/services/PermissionService');
 const { getStrategyFunctions } = require('~/server/services/Files/strategies');
+const { getCategoriesWithCounts, deleteFileByFilter } = require('~/models');
 const { resizeAvatar } = require('~/server/services/Files/images/avatar');
 const { getFileStrategy } = require('~/server/utils/getFileStrategy');
 const { refreshS3Url } = require('~/server/services/Files/S3/crud');
 const { filterFile } = require('~/server/services/Files/process');
 const { updateAction, getActions } = require('~/models/Action');
 const { getCachedTools } = require('~/server/services/Config');
-const { deleteFileByFilter } = require('~/models/File');
-const { getCategoriesWithCounts } = require('~/models');
 const { getLogStores } = require('~/cache');
 
 const systemTools = {
@@ -110,13 +109,17 @@ const createAgentHandler = async (req, res) => {
     const validatedData = agentCreateSchema.parse(req.body);
     const { tools = [], ...agentData } = removeNullishValues(validatedData);
 
+    if (agentData.model_parameters && typeof agentData.model_parameters === 'object') {
+      agentData.model_parameters = removeNullishValues(agentData.model_parameters, true);
+    }
+
     const { id: userId } = req.user;
 
     agentData.id = `agent_${nanoid()}`;
     agentData.author = userId;
     agentData.tools = [];
 
-    const availableTools = await getCachedTools();
+    const availableTools = (await getCachedTools()) ?? {};
     for (const tool of tools) {
       if (availableTools[tool]) {
         agentData.tools.push(tool);
@@ -260,6 +263,11 @@ const updateAgentHandler = async (req, res) => {
     // Preserve explicit null for avatar to allow resetting the avatar
     const { avatar: avatarField, _id, ...rest } = validatedData;
     const updateData = removeNullishValues(rest);
+
+    if (updateData.model_parameters && typeof updateData.model_parameters === 'object') {
+      updateData.model_parameters = removeNullishValues(updateData.model_parameters, true);
+    }
+
     if (avatarField === null) {
       updateData.avatar = avatarField;
     }
