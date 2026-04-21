@@ -3,10 +3,9 @@ const { createContentAggregator } = require('@librechat/agents');
 const {
   initializeAgent,
   validateAgentModel,
+  GenerationJobManager,
   getCustomEndpointConfig,
-  createSequentialChainEdges,
-  createEdgeCollector,
-  filterOrphanedEdges,
+  discoverConnectedAgents,
 } = require('@librechat/api');
 const {
   EModelEndpoint,
@@ -18,12 +17,12 @@ const {
   createToolEndCallback,
   getDefaultHandlers,
 } = require('~/server/controllers/agents/callbacks');
+const { loadAgentTools, loadToolsForExecution } = require('~/server/services/ToolService');
+const { filterFilesByAgentAccess } = require('~/server/services/Files/permissions');
 const { getModelsConfig } = require('~/server/controllers/ModelController');
-const { loadAgentTools } = require('~/server/services/ToolService');
+const { checkPermission } = require('~/server/services/PermissionService');
 const AgentClient = require('~/server/controllers/agents/client');
-const { getConvoFiles } = require('~/models/Conversation');
 const { processAddedConvo } = require('./addedConvo');
-const { getAgent } = require('~/models/Agent');
 const { logViolation } = require('~/cache');
 const db = require('~/models');
 
@@ -31,8 +30,10 @@ const db = require('~/models');
  * Creates a tool loader function for the agent.
  * @param {AbortSignal} signal - The abort signal
  * @param {string | null} [streamId] - The stream ID for resumable mode
+ * @param {boolean} [definitionsOnly=false] - When true, returns only serializable
+ *   tool definitions without creating full tool instances (for event-driven mode)
  */
-function createToolLoader(signal, streamId = null) {
+function createToolLoader(signal, streamId = null, definitionsOnly = false) {
   /**
    * @param {object} params
    * @param {ServerRequest} params.req
@@ -43,21 +44,33 @@ function createToolLoader(signal, streamId = null) {
    * @param {string} params.model
    * @param {AgentToolResources} params.tool_resources
    * @returns {Promise<{
-   * tools: StructuredTool[],
-   * toolContextMap: Record<string, unknown>,
-   * userMCPAuthMap?: Record<string, Record<string, string>>
+   *   tools?: StructuredTool[],
+   *   toolContextMap: Record<string, unknown>,
+   *   toolDefinitions?: import('@librechat/agents').LCTool[],
+   *   userMCPAuthMap?: Record<string, Record<string, string>>,
+   *   toolRegistry?: import('@librechat/agents').LCToolRegistry
    * } | undefined>}
    */
-  return async function loadTools({ req, res, agentId, tools, provider, model, tool_resources }) {
-    const agent = { id: agentId, tools, provider, model };
+  return async function loadTools({
+    req,
+    res,
+    tools,
+    model,
+    agentId,
+    provider,
+    tool_options,
+    tool_resources,
+  }) {
+    const agent = { id: agentId, tools, provider, model, tool_options };
     try {
       return await loadAgentTools({
         req,
         res,
         agent,
         signal,
-        tool_resources,
         streamId,
+        tool_resources,
+        definitionsOnly,
       });
     } catch (error) {
       logger.error('Error loading tools for agent ' + agentId, error);
@@ -65,6 +78,14 @@ function createToolLoader(signal, streamId = null) {
   };
 }
 
+/**
+ * Initializes the AgentClient for a given request/response cycle.
+ * @param {Object} params
+ * @param {Express.Request} params.req
+ * @param {Express.Response} params.res
+ * @param {AbortSignal} params.signal
+ * @param {Object} params.endpointOption
+ */
 const initializeClient = async ({ req, res, signal, endpointOption }) => {
   if (!endpointOption) {
     throw new Error('Endpoint option not provided');
@@ -80,8 +101,52 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
   const artifactPromises = [];
   const { contentParts, aggregateContent } = createContentAggregator();
   const toolEndCallback = createToolEndCallback({ req, res, artifactPromises, streamId });
+
+  /**
+   * Agent context store - populated after initialization, accessed by callback via closure.
+   * Maps agentId -> { userMCPAuthMap, agent, tool_resources, toolRegistry, openAIApiKey }
+   * @type {Map<string, {
+   *   userMCPAuthMap?: Record<string, Record<string, string>>,
+   *   agent?: object,
+   *   tool_resources?: object,
+   *   toolRegistry?: import('@librechat/agents').LCToolRegistry,
+   *   openAIApiKey?: string
+   * }>}
+   */
+  const agentToolContexts = new Map();
+
+  const toolExecuteOptions = {
+    loadTools: async (toolNames, agentId) => {
+      const ctx = agentToolContexts.get(agentId) ?? {};
+      logger.debug(`[ON_TOOL_EXECUTE] ctx found: ${!!ctx.userMCPAuthMap}, agent: ${ctx.agent?.id}`);
+      logger.debug(`[ON_TOOL_EXECUTE] toolRegistry size: ${ctx.toolRegistry?.size ?? 'undefined'}`);
+
+      const result = await loadToolsForExecution({
+        req,
+        res,
+        signal,
+        streamId,
+        toolNames,
+        agent: ctx.agent,
+        toolRegistry: ctx.toolRegistry,
+        userMCPAuthMap: ctx.userMCPAuthMap,
+        tool_resources: ctx.tool_resources,
+        actionsEnabled: ctx.actionsEnabled,
+      });
+
+      logger.debug(`[ON_TOOL_EXECUTE] loaded ${result.loadedTools?.length ?? 0} tools`);
+      return result;
+    },
+    toolEndCallback,
+  };
+
+  const summarizationOptions =
+    appConfig?.summarization?.enabled === false ? { enabled: false } : { enabled: true };
+
   const eventHandlers = getDefaultHandlers({
     res,
+    toolExecuteOptions,
+    summarizationOptions,
     aggregateContent,
     toolEndCallback,
     collectedUsage,
@@ -114,11 +179,14 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
   const agentConfigs = new Map();
   const allowedProviders = new Set(appConfig?.endpoints?.[EModelEndpoint.agents]?.allowedProviders);
 
-  const loadTools = createToolLoader(signal, streamId);
+  /** Event-driven mode: only load tool definitions, not full instances */
+  const loadTools = createToolLoader(signal, streamId, true);
   /** @type {Array<MongoFile>} */
   const requestFiles = req.body.files ?? [];
   /** @type {string} */
   const conversationId = req.body.conversationId;
+  /** @type {string | undefined} */
+  const parentMessageId = req.body.parentMessageId;
 
   const primaryConfig = await initializeAgent(
     {
@@ -127,147 +195,141 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
       loadTools,
       requestFiles,
       conversationId,
+      parentMessageId,
       agent: primaryAgent,
       endpointOption,
       allowedProviders,
       isInitialAgent: true,
     },
     {
-      getConvoFiles,
       getFiles: db.getFiles,
       getUserKey: db.getUserKey,
+      getMessages: db.getMessages,
+      getConvoFiles: db.getConvoFiles,
       updateFilesUsage: db.updateFilesUsage,
       getUserKeyValues: db.getUserKeyValues,
+      getUserCodeFiles: db.getUserCodeFiles,
       getToolFilesByIds: db.getToolFilesByIds,
+      getCodeGeneratedFiles: db.getCodeGeneratedFiles,
+      filterFilesByAgentAccess,
     },
   );
 
-  const agent_ids = primaryConfig.agent_ids;
-  let userMCPAuthMap = primaryConfig.userMCPAuthMap;
+  logger.debug(
+    `[initializeClient] Storing tool context for ${primaryConfig.id}: ${primaryConfig.toolDefinitions?.length ?? 0} tools, registry size: ${primaryConfig.toolRegistry?.size ?? '0'}`,
+  );
+  agentToolContexts.set(primaryConfig.id, {
+    agent: primaryAgent,
+    toolRegistry: primaryConfig.toolRegistry,
+    userMCPAuthMap: primaryConfig.userMCPAuthMap,
+    tool_resources: primaryConfig.tool_resources,
+    actionsEnabled: primaryConfig.actionsEnabled,
+  });
 
-  /** @type {Set<string>} Track agents that failed to load (orphaned references) */
-  const skippedAgentIds = new Set();
-
-  async function processAgent(agentId) {
-    const agent = await getAgent({ id: agentId });
-    if (!agent) {
-      logger.warn(
-        `[processAgent] Handoff agent ${agentId} not found, skipping (orphaned reference)`,
-      );
-      skippedAgentIds.add(agentId);
-      return null;
-    }
-
-    const validationResult = await validateAgentModel({
+  const {
+    agentConfigs: discoveredConfigs,
+    edges: discoveredEdges,
+    userMCPAuthMap: discoveredMCPAuthMap,
+  } = await discoverConnectedAgents(
+    {
       req,
       res,
-      agent,
+      primaryConfig,
+      agent_ids: primaryConfig.agent_ids,
+      endpointOption,
+      allowedProviders,
       modelsConfig,
+      loadTools,
+      requestFiles,
+      conversationId,
+      parentMessageId,
+    },
+    {
+      getAgent: db.getAgent,
+      checkPermission,
       logViolation,
-    });
-
-    if (!validationResult.isValid) {
-      throw new Error(validationResult.error?.message);
-    }
-
-    const config = await initializeAgent(
-      {
-        req,
-        res,
-        agent,
-        loadTools,
-        requestFiles,
-        conversationId,
-        endpointOption,
-        allowedProviders,
-      },
-      {
-        getConvoFiles,
+      db: {
         getFiles: db.getFiles,
         getUserKey: db.getUserKey,
+        getMessages: db.getMessages,
+        getConvoFiles: db.getConvoFiles,
         updateFilesUsage: db.updateFilesUsage,
         getUserKeyValues: db.getUserKeyValues,
+        getUserCodeFiles: db.getUserCodeFiles,
         getToolFilesByIds: db.getToolFilesByIds,
+        getCodeGeneratedFiles: db.getCodeGeneratedFiles,
+        filterFilesByAgentAccess,
       },
-    );
-    if (userMCPAuthMap != null) {
-      Object.assign(userMCPAuthMap, config.userMCPAuthMap ?? {});
-    } else {
-      userMCPAuthMap = config.userMCPAuthMap;
-    }
-    agentConfigs.set(agentId, config);
-    return agent;
-  }
-
-  const checkAgentInit = (agentId) => agentId === primaryConfig.id || agentConfigs.has(agentId);
-
-  // Graph topology discovery for recursive agent handoffs (BFS)
-  const { edgeMap, agentsToProcess, collectEdges } = createEdgeCollector(
-    checkAgentInit,
-    skippedAgentIds,
+      // The callback fires during BFS, before the helper prunes agents
+      // whose edges end up filtered. Don't populate `agentConfigs` here —
+      // `discoveredConfigs` (returned below) is the authoritative pruned
+      // set. The per-agent tool context map is OK to keep populated even
+      // for pruned ids: it's only read by closure in ON_TOOL_EXECUTE,
+      // stale entries are unreachable at runtime.
+      onAgentInitialized: (agentId, agent, config) => {
+        agentToolContexts.set(agentId, {
+          agent,
+          toolRegistry: config.toolRegistry,
+          userMCPAuthMap: config.userMCPAuthMap,
+          tool_resources: config.tool_resources,
+          actionsEnabled: config.actionsEnabled,
+        });
+      },
+      // Pass through the `@librechat/api` exports so that tests which
+      // `jest.mock('@librechat/api')` can override the initializer/validator.
+      initializeAgent,
+      validateAgentModel,
+    },
   );
 
-  // Seed with primary agent's edges
-  collectEdges(primaryConfig.edges);
-
-  // BFS to load and merge all connected agents (enables transitive handoffs: A->B->C)
-  while (agentsToProcess.size > 0) {
-    const agentId = agentsToProcess.values().next().value;
-    agentsToProcess.delete(agentId);
-    try {
-      const agent = await processAgent(agentId);
-      if (agent?.edges?.length) {
-        collectEdges(agent.edges);
-      }
-    } catch (err) {
-      logger.error(`[initializeClient] Error processing agent ${agentId}:`, err);
-    }
+  // Copy the pruned discovery result into the outer map. Anything the
+  // helper dropped (skipped or unreachable after edge filtering) is
+  // intentionally absent. `processAddedConvo` below may still add more
+  // entries for parallel multi-convo execution.
+  for (const [agentId, config] of discoveredConfigs) {
+    agentConfigs.set(agentId, config);
   }
 
-  /** @deprecated Agent Chain */
-  if (agent_ids?.length) {
-    for (const agentId of agent_ids) {
-      if (checkAgentInit(agentId)) {
-        continue;
-      }
-      await processAgent(agentId);
-    }
-    const chain = await createSequentialChainEdges([primaryConfig.id].concat(agent_ids), '{convo}');
-    collectEdges(chain);
-  }
-
-  let edges = Array.from(edgeMap.values());
+  let userMCPAuthMap = discoveredMCPAuthMap;
+  let edges = discoveredEdges;
 
   /** Multi-Convo: Process addedConvo for parallel agent execution */
   const { userMCPAuthMap: updatedMCPAuthMap } = await processAddedConvo({
     req,
     res,
-    endpointOption,
-    modelsConfig,
-    logViolation,
     loadTools,
+    logViolation,
+    modelsConfig,
     requestFiles,
-    conversationId,
-    allowedProviders,
     agentConfigs,
-    primaryAgentId: primaryConfig.id,
     primaryAgent,
+    endpointOption,
     userMCPAuthMap,
+    conversationId,
+    parentMessageId,
+    allowedProviders,
+    primaryAgentId: primaryConfig.id,
   });
 
   if (updatedMCPAuthMap) {
     userMCPAuthMap = updatedMCPAuthMap;
   }
 
-  // Ensure edges is an array when we have multiple agents (multi-agent mode)
-  // MultiAgentGraph.categorizeEdges requires edges to be iterable
-  if (agentConfigs.size > 0 && !edges) {
-    edges = [];
+  for (const [agentId, config] of agentConfigs) {
+    if (agentToolContexts.has(agentId)) {
+      continue;
+    }
+    agentToolContexts.set(agentId, {
+      agent: config,
+      toolRegistry: config.toolRegistry,
+      userMCPAuthMap: config.userMCPAuthMap,
+      tool_resources: config.tool_resources,
+      actionsEnabled: config.actionsEnabled,
+    });
   }
 
-  // Filter out edges referencing non-existent agents (orphaned references)
-  edges = filterOrphanedEdges(edges, skippedAgentIds);
-
+  // `discoverConnectedAgents` always returns a concrete array, so no
+  // further normalization is needed before handing this to `createRun`.
   primaryConfig.edges = edges;
 
   let endpointConfig = appConfig.endpoints?.[primaryConfig.endpoint];
@@ -313,6 +375,10 @@ const initializeClient = async ({ req, res, signal, endpointOption }) => {
     maxContextTokens: primaryConfig.maxContextTokens,
     endpoint: isEphemeralAgentId(primaryConfig.id) ? primaryConfig.endpoint : EModelEndpoint.agents,
   });
+
+  if (streamId) {
+    GenerationJobManager.setCollectedUsage(streamId, collectedUsage);
+  }
 
   return { client, userMCPAuthMap };
 };

@@ -3,6 +3,13 @@ import { ViolationTypes, ErrorTypes } from 'librechat-data-provider';
 import type { Agent, TModelsConfig } from 'librechat-data-provider';
 import type { Request, Response } from 'express';
 
+/**
+ * Permissive Request alias used by {@link validateAgentModel}. Accepts either
+ * the default Express `Request` or the project-specific `ServerRequest`
+ * (see `~/types/http`), whose `params` type is widened to `unknown`.
+ */
+type LooseRequest = Request<unknown, unknown, unknown>;
+
 /** Avatar schema shared between create and update */
 export const agentAvatarSchema = z.object({
   filepath: z.string(),
@@ -44,12 +51,21 @@ export const agentSupportContactSchema = z
 export const graphEdgeSchema = z.object({
   from: z.union([z.string(), z.array(z.string())]),
   to: z.union([z.string(), z.array(z.string())]),
-  description: z.string().optional(),
+  description: z.string().optional().transform((v) => (v === '' ? undefined : v)),
   edgeType: z.enum(['handoff', 'direct']).optional(),
-  prompt: z.union([z.string(), z.function()]).optional(),
+  prompt: z.union([z.string(), z.function()]).optional().transform((v) => (v === '' ? undefined : v)),
   excludeResults: z.boolean().optional(),
-  promptKey: z.string().optional(),
+  promptKey: z.string().optional().transform((v) => (v === '' ? undefined : v)),
 });
+
+/** Per-tool options schema (defer_loading, allowed_callers) */
+export const toolOptionsSchema = z.object({
+  defer_loading: z.boolean().optional(),
+  allowed_callers: z.array(z.enum(['direct', 'code_execution'])).optional(),
+});
+
+/** Agent tool options - map of tool_id to tool options */
+export const agentToolOptionsSchema = z.record(z.string(), toolOptionsSchema).optional();
 
 /** Base agent schema with all common fields */
 export const agentBaseSchema = z.object({
@@ -68,6 +84,7 @@ export const agentBaseSchema = z.object({
   recursion_limit: z.number().optional(),
   conversation_starters: z.array(z.string()).optional(),
   tool_resources: agentToolResourcesSchema,
+  tool_options: agentToolOptionsSchema,
   support_contact: agentSupportContactSchema,
   category: z.string().optional(),
 });
@@ -84,18 +101,15 @@ export const agentUpdateSchema = agentBaseSchema.extend({
   avatar: z.union([agentAvatarSchema, z.null()]).optional(),
   provider: z.string().optional(),
   model: z.string().nullable().optional(),
-  projectIds: z.array(z.string()).optional(),
-  removeProjectIds: z.array(z.string()).optional(),
-  isCollaborative: z.boolean().optional(),
 });
 
-interface ValidateAgentModelParams {
-  req: Request;
+export interface ValidateAgentModelParams {
+  req: LooseRequest;
   res: Response;
   agent: Agent;
   modelsConfig: TModelsConfig;
   logViolation: (
-    req: Request,
+    req: LooseRequest,
     res: Response,
     type: string,
     errorMessage: Record<string, unknown>,
